@@ -29,6 +29,14 @@ except ImportError:
     print("Warning: TensorRT/CUDA not available. Running in CPU mode.")
     JETSON_AVAILABLE = False
 
+# GPU 사용 가능 여부 확인
+if torch.cuda.is_available() and JETSON_AVAILABLE:
+    device = torch.device("cuda")
+    print("GPU mode enabled")
+else:
+    device = torch.device("cpu")
+    print("CPU mode enabled")
+
 # Memory management for Jetson
 import gc
 import psutil
@@ -719,19 +727,23 @@ class JetsonRoadSegmentationSystem:
 
 def main():
     """메인 함수"""
-    import argparse
+    import sys
     
-    parser = argparse.ArgumentParser(description='Jetson Optimized Road Segmentation')
-    parser.add_argument('--video', type=str, help='Input video path')
-    parser.add_argument('--output', type=str, default='output_jetson.mp4', help='Output video path')
+    if len(sys.argv) < 2:
+        print("Usage: python3 road_segment_jetson.py <video_file> [output_file]")
+        sys.exit(1)
     
-    args = parser.parse_args()
+    video_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else 'output_jetson.mp4'
+    
+    print(f"Input video: {video_path}")
+    print(f"Output video: {output_path}")
     
     # 시스템 초기화
-    system = JetsonRoadSegmentationSystem(output_path=args.output)
+    system = JetsonRoadSegmentationSystem(output_path=output_path)
     
     # 실행
-    system.run(args.video)
+    system.run(video_path)
 
 if __name__ == "__main__":
     main()
