@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""
+Jetson Optimized Road Segmentation and Autonomous Driving System
+Optimized for NVIDIA Jetson devices with TensorRT acceleration
+"""
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque
+import gymnasium as gym
+from gymnasium import spaces
+import time
+import threading
+from queue import Queue
+import os
+import sys
+
+# Jetson specific imports
+try:
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    JETSON_AVAILABLE = True
+except ImportError:
+    print("Warning: TensorRT/CUDA not available. Running in CPU mode.")
+    JETSON_AVAILABLE = False
+
+# Memory management for Jetson
+import gc
+import psutil
+
+class JetsonMemoryManager:
+    """Jetson GPU 메모리 관리 클래스"""
+    
+    def __init__(self):
+        self.gpu_memory_usage = 0
+        self.max_gpu_memory = 0.8  # 80% 사용 제한
+        
+    def check_memory(self):
+        """메모리 사용량 체크"""
+        if JETSON_AVAILABLE:
+            try:
+                # GPU 메모리 사용량 체크
+                gpu_memory = cuda.mem_get_info()
+                available_memory = gpu_memory[0] / (1024**3)  # GB
+                total_memory = gpu_memory[1] / (1024**3)  # GB
+                usage_percent = (total_memory - available_memory) / total_memory
+                
+                if usage_percent > self.max_gpu_memory:
+                    print(f"Warning: GPU memory usage high: {usage_percent:.2%}")
+                    self.cleanup_memory()
+                    
+            except Exception as e:
+                print(f"GPU memory check failed: {e}")
+        
+        # CPU 메모리 체크
+        cpu_memory = psutil.virtual_memory()
+        if cpu_memory.percent > 80:
+            print(f"Warning: CPU memory usage high: {cpu_memory.percent:.1f}%")
+            self.cleanup_memory()
+    
+    def cleanup_memory(self):
+        """메모리 정리"""
+        gc.collect()
+        if JETSON_AVAILABLE:
+            try:
+                cuda.Context.pop()
+                cuda.Context.push()
+            except:
+                pass
+
+class JetsonOptimizedLaneDetector:
+    """Jetson 최적화 차선 감지기"""
+    
+    def __init__(self, memory_manager):
+        self.memory_manager = memory_manager
+        self.prev_lane_state = "center"
+        self.change_counter = 0
+        self.threshold_frames = 5
+        self.margin = 50
+        self.vanish_history = []
+        self.lane_width_history = []
+        
+        # 검출 상태
+        self.left_detect = False
+        self.right_detect = False
+        self.left_m = self.right_m = 0
+        self.left_b = self.right_b = (0, 0)
+        
+        # 이전 프레임 lane 좌표 저장
+        self.prev_lanes = [None, None]
+        
+        # Jetson 최적화 설정
+        self.frame_skip = 2  # 프레임 스킵으로 처리 속도 향상
+        self.frame_count = 0
+        
+    def filter_colors(self, image):
+        """색상 필터링 (Jetson 최적화)"""
+        # 이미지 크기 축소로 처리 속도 향상
+        height, width = image.shape[:2]
+        if width > 640:
+            scale = 640 / width
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            image = cv2.resize(image, (new_width, new_height))
+        
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # 흰색 차선
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 30, 255])
+        white_mask = cv2.inRange(hsv, lower_white, upper_white)
+        
+        # 노란색 차선
+        lower_yellow = np.array([18, 50, 50])
+        upper_yellow = np.array([30, 255, 255])
+        yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        
+        # 마스크 결합
+        combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
+        
+        return combined_mask
+    
+    def limit_region(self, image):
+        """ROI 설정"""
+        height, width = image.shape[:2]
+        mask = np.zeros_like(image)
+        
+        # 관심 영역 정의 (다각형)
+        polygon = np.array([
+            [(0, height),
+             (width//2, int(height*0.55)),
+             (width//2, int(height*0.45)),
+             (width, int(height*0.55)),
+             (width, height)]
+        ], dtype=np.int32)
+        
+        cv2.fillPoly(mask, [polygon], 255)
+        masked_image = cv2.bitwise_and(image, mask)
+        
+        return masked_image
+    
+    def houghLines(self, image):
+        """허프 직선 검출 (최적화)"""
+        return cv2.HoughLinesP(
+            image, 
+            1, 
+            np.pi/180, 
+            40, 
+            minLineLength=30, 
+            maxLineGap=120
+        )
+    
+    def separateLine(self, image, lines):
+        """좌우 차선 분리"""
+        left, right = [], []
+        height, width = image.shape[:2]
+        self.img_center = width // 2
+        slope_thresh = 0.3
+        
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                
+                if x2 - x1 == 0:
+                    continue
+                    
+                slope = (y2 - y1) / (x2 - x1)
+                
+                if abs(slope) < slope_thresh:
+                    continue
+                    
+                if slope < 0:  # 왼쪽 차선
+                    left.append(line[0])
+                else:  # 오른쪽 차선
+                    right.append(line[0])
+        
+        return left, right
+    
+    def regression(self, separated, image):
+        """회귀선 계산"""
+        left, right = separated
+        height = image.shape[0]
+        lanes = []
+        
+        # 오른쪽 차선
+        if len(right) > 0:
+            right_x = [line[0] for line in right] + [line[2] for line in right]
+            right_y = [line[1] for line in right] + [line[3] for line in right]
+            
+            if len(right_x) > 1:
+                right_coeff = np.polyfit(right_y, right_x, 1)
+                right_m, right_b = right_coeff
+                
+                # 차선의 시작과 끝점 계산
+                right_start = (int(right_m * height + right_b), height)
+                right_end = (int(right_m * (height * 0.6) + right_b), int(height * 0.6))
+                
+                lanes.append((right_start, right_end))
+                self.right_m, self.right_b = right_m, right_b
+                self.right_detect = True
+            else:
+                lanes.append(self.prev_lanes[0])
+        else:
+            lanes.append(self.prev_lanes[0])
+        
+        # 왼쪽 차선
+        if len(left) > 0:
+            left_x = [line[0] for line in left] + [line[2] for line in left]
+            left_y = [line[1] for line in left] + [line[3] for line in left]
+            
+            if len(left_x) > 1:
+                left_coeff = np.polyfit(left_y, left_x, 1)
+                left_m, left_b = left_coeff
+                
+                # 차선의 시작과 끝점 계산
+                left_start = (int(left_m * height + left_b), height)
+                left_end = (int(left_m * (height * 0.6) + left_b), int(height * 0.6))
+                
+                lanes.append((left_start, left_end))
+                self.left_m, self.left_b = left_m, left_b
+                self.left_detect = True
+            else:
+                lanes.append(self.prev_lanes[1])
+        else:
+            lanes.append(self.prev_lanes[1])
+        
+        self.prev_lanes = lanes
+        return lanes
+    
+    def detect_lane_change(self, lanes):
+        """차선 변경 감지"""
+        if len(lanes) < 2:
+            return "center"
+        
+        left_lane, right_lane = lanes
+        
+        if left_lane is None or right_lane is None:
+            return "center"
+        
+        # 차선 중앙점 계산
+        left_center = (left_lane[0][0] + left_lane[1][0]) // 2
+        right_center = (right_lane[0][0] + right_lane[1][0]) // 2
+        lane_center = (left_center + right_center) // 2
+        
+        # 현재 차선 상태 결정
+        if abs(lane_center - self.img_center) < self.margin:
+            current_state = "center"
+        elif lane_center < self.img_center:
+            current_state = "left"
+        else:
+            current_state = "right"
+        
+        # 차선 변경 감지
+        if current_state != self.prev_lane_state:
+            self.change_counter += 1
+            if self.change_counter >= self.threshold_frames:
+                self.prev_lane_state = current_state
+                return f"change_to_{current_state}"
+        else:
+            self.change_counter = 0
+        
+        return current_state
+    
+    def process_frame(self, frame):
+        """프레임 처리 (Jetson 최적화)"""
+        # 프레임 스킵으로 처리 속도 향상
+        self.frame_count += 1
+        if self.frame_count % self.frame_skip != 0:
+            return None, "center"
+        
+        # 메모리 체크
+        self.memory_manager.check_memory()
+        
+        # 차선 감지 파이프라인
+        filtered = self.filter_colors(frame)
+        roi = self.limit_region(filtered)
+        edges = cv2.Canny(roi, 50, 150)
+        lines = self.houghLines(edges)
+        separated = self.separateLine(edges, lines)
+        lanes = self.regression(separated, frame)
+        lane_state = self.detect_lane_change(lanes)
+        
+        return lanes, lane_state
+
+class JetsonOptimizedDQN(nn.Module):
+    """Jetson 최적화 DQN"""
+    
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(state_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),  # 과적합 방지
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, action_dim)
+        )
+        
+        # Jetson 최적화
+        if JETSON_AVAILABLE:
+            self.cuda()
+    
+    def forward(self, x):
+        return self.fc(x)
+
+class JetsonDrivingEnv(gym.Env):
+    """Jetson 최적화 주행 환경"""
+    
+    def __init__(self, frames, lane_detector, memory_manager):
+        super().__init__()
+        if len(frames) == 0:
+            raise ValueError("frames empty")
+        
+        self.frames = frames
+        self.current_idx = 0
+        self.env_h, self.env_w = frames[0].shape[:2]
+        self.car_x = self.env_w // 2
+        self.lane_detector = lane_detector
+        self.memory_manager = memory_manager
+        
+        # 행동 공간: 0=좌회전, 1=직진, 2=우회전
+        self.action_space = spaces.Discrete(3)
+        
+        # 상태 공간: 차선 위치, 차량 위치 등
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(4,), dtype=np.float32
+        )
+        
+        # 성능 모니터링
+        self.step_count = 0
+        self.reward_history = []
+        
+    def reset(self, seed=None):
+        """환경 리셋"""
+        super().reset(seed=seed)
+        self.current_idx = 0
+        self.step_count = 0
+        return self._get_state(), {}
+    
+    def _get_state(self):
+        """현재 상태 반환"""
+        if self.current_idx >= len(self.frames):
+            return np.zeros(4, dtype=np.float32)
+        
+        frame = self.frames[self.current_idx]
+        lanes, lane_state = self.lane_detector.process_frame(frame)
+        
+        # 상태 벡터 구성
+        state = np.zeros(4, dtype=np.float32)
+        
+        if lanes and len(lanes) >= 2:
+            left_lane, right_lane = lanes
+            
+            if left_lane is not None:
+                left_center = (left_lane[0][0] + left_lane[1][0]) / 2
+                state[0] = left_center / self.env_w  # 정규화
+            else:
+                state[0] = 0.0
+            
+            if right_lane is not None:
+                right_center = (right_lane[0][0] + right_lane[1][0]) / 2
+                state[1] = right_center / self.env_w  # 정규화
+            else:
+                state[1] = 1.0
+            
+            # 차선 중앙
+            if left_lane is not None and right_lane is not None:
+                lane_center = (left_center + right_center) / 2
+                state[2] = lane_center / self.env_w
+            else:
+                state[2] = 0.5
+        
+        # 차량 위치
+        state[3] = self.car_x / self.env_w
+        
+        return state
+    
+    def step(self, action):
+        """한 스텝 진행"""
+        self.step_count += 1
+        
+        # 행동에 따른 차량 위치 업데이트
+        if action == 0:  # 좌회전
+            self.car_x = max(0, self.car_x - 10)
+        elif action == 2:  # 우회전
+            self.car_x = min(self.env_w, self.car_x + 10)
+        
+        # 다음 프레임으로 이동
+        self.current_idx += 1
+        
+        # 상태 획득
+        state = self._get_state()
+        
+        # 보상 계산
+        reward = self._calculate_reward(state, action)
+        self.reward_history.append(reward)
+        
+        # 종료 조건
+        done = self.current_idx >= len(self.frames) - 1
+        
+        # 정보
+        info = {
+            'step': self.step_count,
+            'frame_idx': self.current_idx,
+            'reward': reward
+        }
+        
+        return state, reward, done, False, info
+    
+    def _calculate_reward(self, state, action):
+        """보상 계산"""
+        reward = 0.0
+        
+        # 차선 중앙 유지 보상
+        lane_center = state[2]
+        car_position = state[3]
+        
+        # 차선 중앙에 가까울수록 높은 보상
+        distance_from_center = abs(car_position - lane_center)
+        if distance_from_center < 0.1:
+            reward += 10.0
+        elif distance_from_center < 0.2:
+            reward += 5.0
+        else:
+            reward -= 5.0
+        
+        # 차선 이탈 페널티
+        if distance_from_center > 0.4:
+            reward -= 20.0
+        
+        # 안정적인 주행 보상
+        reward += 1.0
+        
+        return reward
+
+class JetsonRoadSegmentationSystem:
+    """Jetson 최적화 도로 분할 시스템"""
+    
+    def __init__(self, video_path=None, output_path="output_jetson.mp4"):
+        self.video_path = video_path
+        self.output_path = output_path
+        self.memory_manager = JetsonMemoryManager()
+        
+        # 성능 모니터링
+        self.fps_counter = 0
+        self.fps_start_time = time.time()
+        self.processing_times = []
+        
+        # 멀티스레딩 설정
+        self.frame_queue = Queue(maxsize=30)
+        self.result_queue = Queue(maxsize=30)
+        self.running = False
+        
+        print("Jetson Road Segmentation System Initialized")
+        print(f"TensorRT Available: {JETSON_AVAILABLE}")
+    
+    def load_video(self, video_path):
+        """비디오 로드"""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        
+        print("Loading video frames...")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # 프레임 크기 조정 (Jetson 최적화)
+            height, width = frame.shape[:2]
+            if width > 640:
+                scale = 640 / width
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                frame = cv2.resize(frame, (new_width, new_height))
+            
+            frames.append(frame)
+            
+            if len(frames) % 100 == 0:
+                print(f"Loaded {len(frames)} frames")
+        
+        cap.release()
+        print(f"Total frames loaded: {len(frames)}")
+        return frames
+    
+    def train_dqn(self, frames, epochs=100):
+        """DQN 학습"""
+        print("Starting DQN training...")
+        
+        # 환경 및 에이전트 초기화
+        lane_detector = JetsonOptimizedLaneDetector(self.memory_manager)
+        env = JetsonDrivingEnv(frames, lane_detector, self.memory_manager)
+        
+        state_dim = 4
+        action_dim = 3
+        
+        # 네트워크 초기화
+        policy_net = JetsonOptimizedDQN(state_dim, action_dim)
+        target_net = JetsonOptimizedDQN(state_dim, action_dim)
+        target_net.load_state_dict(policy_net.state_dict())
+        
+        optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+        
+        # 경험 리플레이 버퍼
+        buffer = deque(maxlen=10000)
+        
+        # 학습 파라미터
+        gamma = 0.99
+        epsilon = 0.1
+        batch_size = 32
+        update_frequency = 10
+        
+        episode_rewards = []
+        
+        for episode in range(epochs):
+            state, _ = env.reset()
+            total_reward = 0
+            step_count = 0
+            
+            while True:
+                # ε-greedy 정책
+                if random.random() < epsilon:
+                    action = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        q_values = policy_net(torch.tensor(state, dtype=torch.float32))
+                        action = q_values.argmax().item()
+                
+                # 환경에서 한 스텝 진행
+                next_state, reward, done, _, _ = env.step(action)
+                total_reward += reward
+                step_count += 1
+                
+                # 경험 저장
+                buffer.append((state, action, reward, next_state, done))
+                
+                # 배치 학습
+                if len(buffer) >= batch_size:
+                    batch = random.sample(buffer, batch_size)
+                    
+                    states = torch.tensor([exp[0] for exp in batch], dtype=torch.float32)
+                    actions = torch.tensor([exp[1] for exp in batch], dtype=torch.long)
+                    rewards = torch.tensor([exp[2] for exp in batch], dtype=torch.float32)
+                    next_states = torch.tensor([exp[3] for exp in batch], dtype=torch.float32)
+                    dones = torch.tensor([exp[4] for exp in batch], dtype=torch.bool)
+                    
+                    # Q-러닝 업데이트
+                    current_q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze()
+                    
+                    with torch.no_grad():
+                        next_q_values = target_net(next_states).max(1)[0]
+                        target_q_values = rewards + gamma * (1 - dones.float()) * next_q_values
+                    
+                    loss = nn.MSELoss()(current_q_values, target_q_values)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                
+                state = next_state
+                
+                if done:
+                    break
+            
+            episode_rewards.append(total_reward)
+            
+            # 타겟 네트워크 업데이트
+            if episode % update_frequency == 0:
+                target_net.load_state_dict(policy_net.state_dict())
+            
+            if episode % 10 == 0:
+                avg_reward = np.mean(episode_rewards[-10:])
+                print(f"Episode {episode}, Avg Reward: {avg_reward:.2f}")
+            
+            # 메모리 정리
+            if episode % 50 == 0:
+                self.memory_manager.cleanup_memory()
+        
+        print("DQN training completed!")
+        return policy_net, env
+    
+    def process_video(self, frames, policy_net=None):
+        """비디오 처리 및 결과 생성"""
+        print("Processing video...")
+        
+        if len(frames) == 0:
+            print("No frames to process")
+            return
+        
+        # 비디오 작성자 초기화
+        height, width = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(self.output_path, fourcc, 30.0, (width, height))
+        
+        # 차선 감지기 초기화
+        lane_detector = JetsonOptimizedLaneDetector(self.memory_manager)
+        
+        # 성능 모니터링
+        total_frames = len(frames)
+        start_time = time.time()
+        
+        for i, frame in enumerate(frames):
+            frame_start_time = time.time()
+            
+            # 차선 감지
+            lanes, lane_state = lane_detector.process_frame(frame)
+            
+            # 결과 시각화
+            overlay = frame.copy()
+            output = frame.copy()
+            
+            if lanes and len(lanes) >= 2:
+                left_lane, right_lane = lanes
+                
+                # 차선 그리기
+                if left_lane is not None:
+                    cv2.line(overlay, left_lane[0], left_lane[1], (0, 255, 0), 3)
+                
+                if right_lane is not None:
+                    cv2.line(overlay, right_lane[0], right_lane[1], (0, 255, 0), 3)
+                
+                # 차선 중앙선 그리기
+                if left_lane is not None and right_lane is not None:
+                    left_center = ((left_lane[0][0] + left_lane[1][0]) // 2,
+                                 (left_lane[0][1] + left_lane[1][1]) // 2)
+                    right_center = ((right_lane[0][0] + right_lane[1][0]) // 2,
+                                   (right_lane[0][1] + right_lane[1][1]) // 2)
+                    
+                    lane_center = ((left_center[0] + right_center[0]) // 2,
+                                  (left_center[1] + right_center[1]) // 2)
+                    
+                    cv2.circle(overlay, lane_center, 5, (0, 0, 255), -1)
+            
+            # 차선 상태 표시
+            cv2.putText(overlay, f"Lane: {lane_state}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # FPS 계산
+            self.fps_counter += 1
+            if time.time() - self.fps_start_time >= 1.0:
+                fps = self.fps_counter / (time.time() - self.fps_start_time)
+                self.fps_counter = 0
+                self.fps_start_time = time.time()
+            
+            # FPS 표시
+            cv2.putText(overlay, f"FPS: {fps:.1f}", (10, 70),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # 진행률 표시
+            progress = (i + 1) / total_frames * 100
+            cv2.putText(overlay, f"Progress: {progress:.1f}%", (10, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # 프레임 처리 시간 측정
+            frame_time = time.time() - frame_start_time
+            self.processing_times.append(frame_time)
+            
+            # 결과 저장
+            out.write(overlay)
+            
+            # 진행률 출력
+            if i % 100 == 0:
+                elapsed_time = time.time() - start_time
+                avg_fps = (i + 1) / elapsed_time
+                print(f"Processed {i+1}/{total_frames} frames, "
+                      f"Avg FPS: {avg_fps:.1f}, "
+                      f"Avg Processing Time: {np.mean(self.processing_times):.3f}s")
+        
+        out.release()
+        
+        # 성능 통계 출력
+        total_time = time.time() - start_time
+        avg_fps = total_frames / total_time
+        avg_processing_time = np.mean(self.processing_times)
+        
+        print(f"\nProcessing completed!")
+        print(f"Total frames: {total_frames}")
+        print(f"Total time: {total_time:.2f}s")
+        print(f"Average FPS: {avg_fps:.1f}")
+        print(f"Average processing time per frame: {avg_processing_time:.3f}s")
+        print(f"Output saved to: {self.output_path}")
+    
+    def run(self, video_path=None):
+        """메인 실행 함수"""
+        if video_path:
+            self.video_path = video_path
+        
+        if not self.video_path:
+            print("Error: No video path provided")
+            return
+        
+        try:
+            # 비디오 로드
+            frames = self.load_video(self.video_path)
+            
+            # DQN 학습 (선택사항)
+            print("Do you want to train DQN? (y/n): ", end="")
+            train_choice = input().lower().strip()
+            
+            policy_net = None
+            if train_choice == 'y':
+                policy_net, _ = self.train_dqn(frames)
+            
+            # 비디오 처리
+            self.process_video(frames, policy_net)
+            
+        except Exception as e:
+            print(f"Error during execution: {e}")
+            import traceback
+            traceback.print_exc()
+
+def main():
+    """메인 함수"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Jetson Optimized Road Segmentation')
+    parser.add_argument('--video', type=str, help='Input video path')
+    parser.add_argument('--output', type=str, default='output_jetson.mp4', help='Output video path')
+    
+    args = parser.parse_args()
+    
+    # 시스템 초기화
+    system = JetsonRoadSegmentationSystem(output_path=args.output)
+    
+    # 실행
+    system.run(args.video)
+
+if __name__ == "__main__":
+    main()
